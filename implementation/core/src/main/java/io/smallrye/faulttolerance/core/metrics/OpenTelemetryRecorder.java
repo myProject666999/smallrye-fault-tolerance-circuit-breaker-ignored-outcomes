@@ -1,0 +1,454 @@
+package io.smallrye.faulttolerance.core.metrics;
+
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.BULKHEAD_CALLS_TOTAL;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.BULKHEAD_CONFIG_LIMIT;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.BULKHEAD_CONFIG_QUEUE_SIZE;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.BULKHEAD_EXECUTIONS_RUNNING;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.BULKHEAD_EXECUTIONS_WAITING;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.BULKHEAD_RUNNING_DURATION;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.BULKHEAD_WAITING_DURATION;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.CIRCUIT_BREAKER_CALLS_TOTAL;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.CIRCUIT_BREAKER_CONFIG_DELAY;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.CIRCUIT_BREAKER_CONFIG_FAILURE_RATIO;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.CIRCUIT_BREAKER_CONFIG_REQUEST_VOLUME_THRESHOLD;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.CIRCUIT_BREAKER_CONFIG_SUCCESS_THRESHOLD;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.CIRCUIT_BREAKER_OPENED_TOTAL;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.CIRCUIT_BREAKER_STATE_CURRENT;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.CIRCUIT_BREAKER_STATE_TOTAL;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.INVOCATIONS_DURATION;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.INVOCATIONS_TOTAL;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.RATE_LIMIT_CALLS_TOTAL;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.RATE_LIMIT_CONFIG_LIMIT;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.RATE_LIMIT_CONFIG_MIN_SPACING;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.RATE_LIMIT_CONFIG_WINDOW;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.RETRY_CALLS_TOTAL;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.RETRY_CONFIG_MAX_DURATION;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.RETRY_CONFIG_MAX_RETRIES;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.RETRY_RETRIES_TOTAL;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.TIMEOUT_CALLS_TOTAL;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.TIMEOUT_CONFIG_DURATION;
+import static io.smallrye.faulttolerance.core.metrics.MetricsConstants.TIMEOUT_EXECUTION_DURATION;
+
+import java.util.List;
+import java.util.function.BooleanSupplier;
+import java.util.function.DoubleSupplier;
+import java.util.function.LongSupplier;
+
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.metrics.DoubleHistogram;
+import io.opentelemetry.api.metrics.LongCounter;
+import io.opentelemetry.api.metrics.Meter;
+import io.smallrye.faulttolerance.core.circuit.breaker.CircuitBreakerEvents;
+
+public class OpenTelemetryRecorder implements MetricsRecorder {
+    private static final List<Double> BUCKET_BOUNDARIES = List.of(
+            0.005, 0.01,
+            0.025, 0.05, 0.075, 0.1,
+            0.25, 0.5, 0.75, 1.0,
+            2.5, 5.0, 7.5, 10.0);
+    private static final double NANOS_TO_SECONDS = 1.0 / 1_000_000_000.0;
+
+    static final AttributeKey<String> METHOD = AttributeKey.stringKey("method");
+
+    static final AttributeKey<String> RESULT = AttributeKey.stringKey("result");
+    static final String RESULT_VALUE_RETURNED = "valueReturned";
+    static final String RESULT_EXCEPTION_THROWN = "exceptionThrown";
+
+    static final AttributeKey<String> FALLBACK = AttributeKey.stringKey("fallback");
+    static final String FALLBACK_APPLIED = "applied";
+    static final String FALLBACK_NOT_APPLIED = "notApplied";
+    static final String FALLBACK_NOT_DEFINED = "notDefined";
+
+    static final AttributeKey<String> RETRIED = AttributeKey.stringKey("retried");
+    static final String RETRIED_TRUE = "true";
+    static final String RETRIED_FALSE = "false";
+    static final AttributeKey<String> RETRY_RESULT = AttributeKey.stringKey("retryResult");
+    static final String RETRY_RESULT_VALUE_RETURNED = "valueReturned";
+    static final String RETRY_RESULT_EXCEPTION_NOT_RETRYABLE = "exceptionNotRetryable";
+    static final String RETRY_RESULT_MAX_RETRIES_REACHED = "maxRetriesReached";
+    static final String RETRY_RESULT_MAX_DURATION_REACHED = "maxDurationReached";
+
+    static final AttributeKey<String> TIMED_OUT = AttributeKey.stringKey("timedOut");
+    static final String TIMED_OUT_TRUE = "true";
+    static final String TIMED_OUT_FALSE = "false";
+
+    static final AttributeKey<String> CIRCUIT_BREAKER_RESULT = AttributeKey.stringKey("circuitBreakerResult");
+    static final String CIRCUIT_BREAKER_RESULT_SUCCESS = "success";
+    static final String CIRCUIT_BREAKER_RESULT_FAILURE = "failure";
+    static final String CIRCUIT_BREAKER_RESULT_CB_OPEN = "circuitBreakerOpen";
+
+    static final AttributeKey<String> CIRCUIT_BREAKER_STATE = AttributeKey.stringKey("state");
+    static final String CIRCUIT_BREAKER_STATE_CLOSED = "closed";
+    static final String CIRCUIT_BREAKER_STATE_OPEN = "open";
+    static final String CIRCUIT_BREAKER_STATE_HALF_OPEN = "halfOpen";
+
+    static final AttributeKey<String> BULKHEAD_RESULT = AttributeKey.stringKey("bulkheadResult");
+    static final String BULKHEAD_RESULT_ACCEPTED = "accepted";
+    static final String BULKHEAD_RESULT_REJECTED = "rejected";
+
+    static final AttributeKey<String> RATE_LIMIT_RESULT = AttributeKey.stringKey("rateLimitResult");
+    static final String RATE_LIMIT_RESULT_PERMITTED = "permitted";
+    static final String RATE_LIMIT_RESULT_REJECTED = "rejected";
+
+    private final Meter meter;
+    private final String methodName;
+
+    private final LongCounter invocationsTotal;
+    private final DoubleHistogram invocationsDuration;
+    private final LongCounter retryCallsTotal;
+    private final LongCounter retryRetriesTotal;
+    private final LongCounter timeoutCallsTotal;
+    private final DoubleHistogram timeoutExecutionDuration;
+    private final LongCounter circuitBreakerCallsTotal;
+    private final LongCounter circuitBreakerOpenedTotal;
+    private final LongCounter bulkheadCallsTotal;
+    private final DoubleHistogram bulkheadRunningDuration;
+    private final DoubleHistogram bulkheadWaitingDuration;
+    private final LongCounter rateLimitCallsTotal;
+
+    public OpenTelemetryRecorder(Meter meter, MeteredOperation operation) {
+        this.meter = meter;
+        this.methodName = operation.name();
+
+        this.invocationsTotal = meter.counterBuilder(INVOCATIONS_TOTAL).build();
+        this.invocationsDuration = meter.histogramBuilder(INVOCATIONS_DURATION)
+                .setUnit("seconds")
+                .setExplicitBucketBoundariesAdvice(BUCKET_BOUNDARIES)
+                .build();
+
+        if (operation.hasRetry()) {
+            this.retryCallsTotal = meter.counterBuilder(RETRY_CALLS_TOTAL).build();
+            this.retryRetriesTotal = meter.counterBuilder(RETRY_RETRIES_TOTAL).build();
+
+            registerAsyncGauge(operation::retryMaxRetries, RETRY_CONFIG_MAX_RETRIES,
+                    Attributes.of(METHOD, methodName));
+            registerAsyncDurationGauge(() -> operation.retryMaxDuration() * NANOS_TO_SECONDS, RETRY_CONFIG_MAX_DURATION,
+                    Attributes.of(METHOD, methodName));
+        } else {
+            this.retryCallsTotal = null;
+            this.retryRetriesTotal = null;
+        }
+
+        if (operation.hasTimeout()) {
+            this.timeoutCallsTotal = meter.counterBuilder(TIMEOUT_CALLS_TOTAL).build();
+            this.timeoutExecutionDuration = meter.histogramBuilder(TIMEOUT_EXECUTION_DURATION)
+                    .setUnit("seconds")
+                    .setExplicitBucketBoundariesAdvice(BUCKET_BOUNDARIES)
+                    .build();
+
+            registerAsyncDurationGauge(() -> operation.timeoutDuration() * NANOS_TO_SECONDS, TIMEOUT_CONFIG_DURATION,
+                    Attributes.of(METHOD, methodName));
+        } else {
+            this.timeoutCallsTotal = null;
+            this.timeoutExecutionDuration = null;
+        }
+
+        if (operation.hasCircuitBreaker()) {
+            this.circuitBreakerCallsTotal = meter.counterBuilder(CIRCUIT_BREAKER_CALLS_TOTAL).build();
+            this.circuitBreakerOpenedTotal = meter.counterBuilder(CIRCUIT_BREAKER_OPENED_TOTAL).build();
+
+            registerAsyncGauge(operation::circuitBreakerDelay, CIRCUIT_BREAKER_CONFIG_DELAY, "nanoseconds",
+                    Attributes.of(METHOD, methodName));
+            registerAsyncGauge(operation::circuitBreakerRequestVolumeThreshold,
+                    CIRCUIT_BREAKER_CONFIG_REQUEST_VOLUME_THRESHOLD, Attributes.of(METHOD, methodName));
+            registerAsyncGauge(operation::circuitBreakerFailureRatio, CIRCUIT_BREAKER_CONFIG_FAILURE_RATIO,
+                    Attributes.of(METHOD, methodName));
+            registerAsyncGauge(operation::circuitBreakerSuccessThreshold, CIRCUIT_BREAKER_CONFIG_SUCCESS_THRESHOLD,
+                    Attributes.of(METHOD, methodName));
+        } else {
+            this.circuitBreakerCallsTotal = null;
+            this.circuitBreakerOpenedTotal = null;
+        }
+
+        if (operation.hasBulkhead()) {
+            this.bulkheadCallsTotal = meter.counterBuilder(BULKHEAD_CALLS_TOTAL).build();
+            this.bulkheadRunningDuration = meter.histogramBuilder(BULKHEAD_RUNNING_DURATION)
+                    .setUnit("seconds")
+                    .setExplicitBucketBoundariesAdvice(BUCKET_BOUNDARIES)
+                    .build();
+            if (operation.mayBeAsynchronous()) {
+                this.bulkheadWaitingDuration = meter.histogramBuilder(BULKHEAD_WAITING_DURATION)
+                        .setUnit("seconds")
+                        .setExplicitBucketBoundariesAdvice(BUCKET_BOUNDARIES)
+                        .build();
+            } else {
+                this.bulkheadWaitingDuration = null;
+            }
+
+            registerAsyncGauge(operation::bulkheadLimit, BULKHEAD_CONFIG_LIMIT,
+                    Attributes.of(METHOD, methodName));
+            if (operation.mayBeAsynchronous()) {
+                registerAsyncGauge(operation::bulkheadQueueSize, BULKHEAD_CONFIG_QUEUE_SIZE,
+                        Attributes.of(METHOD, methodName));
+            }
+        } else {
+            this.bulkheadCallsTotal = null;
+            this.bulkheadRunningDuration = null;
+            this.bulkheadWaitingDuration = null;
+        }
+
+        if (operation.hasRateLimit()) {
+            this.rateLimitCallsTotal = meter.counterBuilder(RATE_LIMIT_CALLS_TOTAL).build();
+
+            registerAsyncGauge(operation::rateLimitLimit, RATE_LIMIT_CONFIG_LIMIT,
+                    Attributes.of(METHOD, methodName));
+            registerAsyncDurationGauge(() -> operation.rateLimitWindow() * NANOS_TO_SECONDS, RATE_LIMIT_CONFIG_WINDOW,
+                    Attributes.of(METHOD, methodName));
+            registerAsyncDurationGauge(() -> operation.rateLimitMinSpacing() * NANOS_TO_SECONDS,
+                    RATE_LIMIT_CONFIG_MIN_SPACING, Attributes.of(METHOD, methodName));
+        } else {
+            this.rateLimitCallsTotal = null;
+        }
+    }
+
+    private void registerAsyncUpDownCounter(LongSupplier supplier, String name, Attributes attributes) {
+        meter.upDownCounterBuilder(name).buildWithCallback(m -> m.record(supplier.getAsLong(), attributes));
+    }
+
+    private void registerAsyncUpDownCounter(BooleanSupplier supplier, String name, Attributes attributes) {
+        meter.upDownCounterBuilder(name).buildWithCallback(m -> m.record(supplier.getAsBoolean() ? 1 : 0, attributes));
+    }
+
+    private void registerAsyncCounter(LongSupplier supplier, String name, String unit, Attributes attributes) {
+        meter.counterBuilder(name).setUnit(unit).buildWithCallback(m -> m.record(supplier.getAsLong(), attributes));
+    }
+
+    private void registerAsyncGauge(LongSupplier supplier, String name, Attributes attributes) {
+        meter.gaugeBuilder(name).ofLongs().buildWithCallback(m -> m.record(supplier.getAsLong(), attributes));
+    }
+
+    private void registerAsyncGauge(LongSupplier supplier, String name, String unit, Attributes attributes) {
+        meter.gaugeBuilder(name).setUnit(unit).ofLongs().buildWithCallback(m -> m.record(supplier.getAsLong(), attributes));
+    }
+
+    private void registerAsyncGauge(DoubleSupplier supplier, String name, Attributes attributes) {
+        meter.gaugeBuilder(name).buildWithCallback(m -> m.record(supplier.getAsDouble(), attributes));
+    }
+
+    private void registerAsyncDurationGauge(DoubleSupplier supplier, String name, Attributes attributes) {
+        meter.gaugeBuilder(name).setUnit("seconds").buildWithCallback(m -> m.record(supplier.getAsDouble(), attributes));
+    }
+
+    // ---
+
+    // the instrument fields have a value only if the operation declares the corresponding strategy,
+    // but a metrics recorder may be shared by multiple operations with the same cache key and different
+    // strategies, so a record method may be called even when the corresponding field is `null`;
+    // in that case, the instrument is created on demand
+
+    @Override
+    public void executionFinished(boolean succeeded, boolean fallbackDefined, boolean fallbackApplied, long duration) {
+        String fallback = fallbackDefined
+                ? (fallbackApplied ? FALLBACK_APPLIED : FALLBACK_NOT_APPLIED)
+                : FALLBACK_NOT_DEFINED;
+
+        invocationsTotal.add(1, Attributes.of(
+                METHOD, methodName,
+                RESULT, succeeded ? RESULT_VALUE_RETURNED : RESULT_EXCEPTION_THROWN,
+                FALLBACK, fallback));
+        invocationsDuration.record(duration * NANOS_TO_SECONDS, Attributes.of(METHOD, methodName));
+    }
+
+    @Override
+    public void retryAttempted() {
+        LongCounter counter = retryRetriesTotal;
+        if (counter == null) {
+            counter = meter.counterBuilder(RETRY_RETRIES_TOTAL).build();
+        }
+        counter.add(1, Attributes.of(METHOD, methodName));
+
+    }
+
+    @Override
+    public void retryValueReturned(boolean retried) {
+        LongCounter counter = retryCallsTotal;
+        if (counter == null) {
+            counter = meter.counterBuilder(MetricsConstants.RETRY_CALLS_TOTAL).build();
+        }
+        counter.add(1, Attributes.of(
+                METHOD, methodName,
+                RETRIED, retried ? RETRIED_TRUE : RETRIED_FALSE,
+                RETRY_RESULT, RETRY_RESULT_VALUE_RETURNED));
+    }
+
+    @Override
+    public void retryExceptionNotRetryable(boolean retried) {
+        LongCounter counter = retryCallsTotal;
+        if (counter == null) {
+            counter = meter.counterBuilder(MetricsConstants.RETRY_CALLS_TOTAL).build();
+        }
+        counter.add(1, Attributes.of(
+                METHOD, methodName,
+                RETRIED, retried ? RETRIED_TRUE : RETRIED_FALSE,
+                RETRY_RESULT, RETRY_RESULT_EXCEPTION_NOT_RETRYABLE));
+    }
+
+    @Override
+    public void retryMaxRetriesReached(boolean retried) {
+        LongCounter counter = retryCallsTotal;
+        if (counter == null) {
+            counter = meter.counterBuilder(MetricsConstants.RETRY_CALLS_TOTAL).build();
+        }
+        counter.add(1, Attributes.of(
+                METHOD, methodName,
+                RETRIED, retried ? RETRIED_TRUE : RETRIED_FALSE,
+                RETRY_RESULT, RETRY_RESULT_MAX_RETRIES_REACHED));
+    }
+
+    @Override
+    public void retryMaxDurationReached(boolean retried) {
+        LongCounter counter = retryCallsTotal;
+        if (counter == null) {
+            counter = meter.counterBuilder(MetricsConstants.RETRY_CALLS_TOTAL).build();
+        }
+        counter.add(1, Attributes.of(
+                METHOD, methodName,
+                RETRIED, retried ? RETRIED_TRUE : RETRIED_FALSE,
+                RETRY_RESULT, RETRY_RESULT_MAX_DURATION_REACHED));
+    }
+
+    @Override
+    public void timeoutFinished(boolean timedOut, long time) {
+        LongCounter counter = timeoutCallsTotal;
+        if (counter == null) {
+            counter = meter.counterBuilder(MetricsConstants.TIMEOUT_CALLS_TOTAL).build();
+        }
+        counter.add(1, Attributes.of(
+                METHOD, methodName,
+                TIMED_OUT, timedOut ? TIMED_OUT_TRUE : TIMED_OUT_FALSE));
+
+        DoubleHistogram histogram = timeoutExecutionDuration;
+        if (histogram == null) {
+            histogram = meter.histogramBuilder(MetricsConstants.TIMEOUT_EXECUTION_DURATION)
+                    .setUnit("seconds")
+                    .setExplicitBucketBoundariesAdvice(BUCKET_BOUNDARIES)
+                    .build();
+        }
+        histogram.record(time * NANOS_TO_SECONDS, Attributes.of(METHOD, methodName));
+    }
+
+    @Override
+    public void circuitBreakerFinished(CircuitBreakerEvents.Result result) {
+        String circuitBreakerResult = switch (result) {
+            case SUCCESS -> CIRCUIT_BREAKER_RESULT_SUCCESS;
+            case FAILURE -> CIRCUIT_BREAKER_RESULT_FAILURE;
+            case PREVENTED -> CIRCUIT_BREAKER_RESULT_CB_OPEN;
+            default -> throw new IllegalArgumentException("Unknown circuit breaker result: " + result);
+        };
+        LongCounter counter = circuitBreakerCallsTotal;
+        if (counter == null) {
+            counter = meter.counterBuilder(MetricsConstants.CIRCUIT_BREAKER_CALLS_TOTAL).build();
+        }
+        counter.add(1, Attributes.of(
+                METHOD, methodName,
+                CIRCUIT_BREAKER_RESULT, circuitBreakerResult));
+    }
+
+    @Override
+    public void circuitBreakerMovedToOpen() {
+        LongCounter counter = circuitBreakerOpenedTotal;
+        if (counter == null) {
+            counter = meter.counterBuilder(MetricsConstants.CIRCUIT_BREAKER_OPENED_TOTAL).build();
+        }
+        counter.add(1, Attributes.of(METHOD, methodName));
+    }
+
+    @Override
+    public void registerCircuitBreakerIsClosed(BooleanSupplier supplier) {
+        registerAsyncUpDownCounter(supplier, CIRCUIT_BREAKER_STATE_CURRENT, Attributes.of(
+                METHOD, methodName,
+                CIRCUIT_BREAKER_STATE, CIRCUIT_BREAKER_STATE_CLOSED));
+    }
+
+    @Override
+    public void registerCircuitBreakerIsOpen(BooleanSupplier supplier) {
+        registerAsyncUpDownCounter(supplier, CIRCUIT_BREAKER_STATE_CURRENT, Attributes.of(
+                METHOD, methodName,
+                CIRCUIT_BREAKER_STATE, CIRCUIT_BREAKER_STATE_OPEN));
+    }
+
+    @Override
+    public void registerCircuitBreakerIsHalfOpen(BooleanSupplier supplier) {
+        registerAsyncUpDownCounter(supplier, CIRCUIT_BREAKER_STATE_CURRENT, Attributes.of(
+                METHOD, methodName,
+                CIRCUIT_BREAKER_STATE, CIRCUIT_BREAKER_STATE_HALF_OPEN));
+    }
+
+    @Override
+    public void registerCircuitBreakerTimeSpentInClosed(LongSupplier supplier) {
+        registerAsyncCounter(supplier, CIRCUIT_BREAKER_STATE_TOTAL, "nanoseconds", Attributes.of(
+                METHOD, methodName,
+                CIRCUIT_BREAKER_STATE, CIRCUIT_BREAKER_STATE_CLOSED));
+    }
+
+    @Override
+    public void registerCircuitBreakerTimeSpentInOpen(LongSupplier supplier) {
+        registerAsyncCounter(supplier, CIRCUIT_BREAKER_STATE_TOTAL, "nanoseconds", Attributes.of(
+                METHOD, methodName,
+                CIRCUIT_BREAKER_STATE, CIRCUIT_BREAKER_STATE_OPEN));
+    }
+
+    @Override
+    public void registerCircuitBreakerTimeSpentInHalfOpen(LongSupplier supplier) {
+        registerAsyncCounter(supplier, CIRCUIT_BREAKER_STATE_TOTAL, "nanoseconds", Attributes.of(
+                METHOD, methodName,
+                CIRCUIT_BREAKER_STATE, CIRCUIT_BREAKER_STATE_HALF_OPEN));
+    }
+
+    @Override
+    public void bulkheadDecisionMade(boolean accepted) {
+        LongCounter counter = bulkheadCallsTotal;
+        if (counter == null) {
+            counter = meter.counterBuilder(MetricsConstants.BULKHEAD_CALLS_TOTAL).build();
+        }
+        counter.add(1, Attributes.of(
+                METHOD, methodName,
+                BULKHEAD_RESULT, accepted ? BULKHEAD_RESULT_ACCEPTED : BULKHEAD_RESULT_REJECTED));
+    }
+
+    @Override
+    public void registerBulkheadExecutionsRunning(LongSupplier supplier) {
+        registerAsyncUpDownCounter(supplier, BULKHEAD_EXECUTIONS_RUNNING, Attributes.of(METHOD, methodName));
+    }
+
+    @Override
+    public void registerBulkheadExecutionsWaiting(LongSupplier supplier) {
+        registerAsyncUpDownCounter(supplier, BULKHEAD_EXECUTIONS_WAITING, Attributes.of(METHOD, methodName));
+    }
+
+    @Override
+    public void updateBulkheadRunningDuration(long time) {
+        DoubleHistogram histogram = bulkheadRunningDuration;
+        if (histogram == null) {
+            histogram = meter.histogramBuilder(MetricsConstants.BULKHEAD_RUNNING_DURATION)
+                    .setUnit("seconds")
+                    .setExplicitBucketBoundariesAdvice(BUCKET_BOUNDARIES)
+                    .build();
+        }
+        histogram.record(time * NANOS_TO_SECONDS, Attributes.of(METHOD, methodName));
+    }
+
+    @Override
+    public void updateBulkheadWaitingDuration(long time) {
+        DoubleHistogram histogram = bulkheadWaitingDuration;
+        if (histogram == null) {
+            histogram = meter.histogramBuilder(MetricsConstants.BULKHEAD_WAITING_DURATION)
+                    .setUnit("seconds")
+                    .setExplicitBucketBoundariesAdvice(BUCKET_BOUNDARIES)
+                    .build();
+        }
+        histogram.record(time * NANOS_TO_SECONDS, Attributes.of(METHOD, methodName));
+    }
+
+    @Override
+    public void rateLimitDecisionMade(boolean permitted) {
+        LongCounter counter = rateLimitCallsTotal;
+        if (counter == null) {
+            counter = meter.counterBuilder(MetricsConstants.RATE_LIMIT_CALLS_TOTAL).build();
+        }
+        counter.add(1, Attributes.of(
+                METHOD, methodName,
+                RATE_LIMIT_RESULT, permitted ? RATE_LIMIT_RESULT_PERMITTED : RATE_LIMIT_RESULT_REJECTED));
+    }
+}

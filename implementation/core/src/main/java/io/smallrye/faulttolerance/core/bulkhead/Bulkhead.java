@@ -1,0 +1,295 @@
+package io.smallrye.faulttolerance.core.bulkhead;
+
+import static io.smallrye.faulttolerance.core.bulkhead.BulkheadLogger.LOG;
+
+import java.util.Deque;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+
+import org.eclipse.microprofile.faulttolerance.exceptions.BulkheadException;
+
+import io.smallrye.faulttolerance.core.Completer;
+import io.smallrye.faulttolerance.core.FaultToleranceContext;
+import io.smallrye.faulttolerance.core.FaultToleranceStrategy;
+import io.smallrye.faulttolerance.core.Future;
+import io.smallrye.faulttolerance.core.async.FutureCancellationEvent;
+import io.smallrye.faulttolerance.core.util.RunnableWrapper;
+
+/**
+ * Unified bulkhead that behaves in a semaphore fashion for synchronous executions
+ * and in a thread pool fashion for asynchronous executions.
+ * <p>
+ * Implements a proper queue of tasks for async executions. When an async task
+ * (that was previously allowed to enter) leaves the bulkhead, it will attempt
+ * to take one task from the queue and execute it.
+ * <p>
+ * It also allows synchronous queueing, which is an implementation of a thread pool
+ * bulkhead for pseudo-asynchronous invocations. Those are already offloaded to
+ * an extra thread and so don't require proper queueing, just two semaphores.
+ */
+public class Bulkhead<V> implements FaultToleranceStrategy<V> {
+    private final FaultToleranceStrategy<V> delegate;
+    private final String description;
+
+    private final Deque<BulkheadTask> queue;
+    private final Semaphore capacitySemaphore;
+    private final Semaphore workSemaphore;
+    private final boolean syncQueueing;
+    private final RunnableWrapper runnableWrapper;
+
+    // `syncQueueing` may only be enabled if this bulkhead is executed on an extra thread
+    public Bulkhead(FaultToleranceStrategy<V> delegate, String description, int size, int queueSize, boolean syncQueueing) {
+        this(delegate, description, size, queueSize, syncQueueing, RunnableWrapper.INSTANCE);
+    }
+
+    // only for tests
+    Bulkhead(FaultToleranceStrategy<V> delegate, String description, int size, int queueSize, boolean syncQueueing,
+            RunnableWrapper runnableWrapper) {
+        this.delegate = delegate;
+        this.description = description;
+        this.queue = new ConcurrentLinkedDeque<>();
+        this.capacitySemaphore = new Semaphore(Math.addExact(size, queueSize), true);
+        this.workSemaphore = new Semaphore(size, true);
+        this.syncQueueing = syncQueueing;
+        this.runnableWrapper = runnableWrapper;
+    }
+
+    @Override
+    public Future<V> apply(FaultToleranceContext<V> ctx) {
+        LOG.trace("Bulkhead started");
+        try {
+            if (ctx.isSync()) {
+                if (syncQueueing) {
+                    return applySyncWithQueueing(ctx);
+                } else {
+                    return applySync(ctx);
+                }
+            } else {
+                return applyAsync(ctx);
+            }
+        } finally {
+            LOG.trace("Bulkhead finished");
+        }
+    }
+
+    private Future<V> applySync(FaultToleranceContext<V> ctx) {
+        if (capacitySemaphore.tryAcquire()) {
+            LOG.trace("Capacity semaphore acquired, accepting task into bulkhead");
+            if (workSemaphore.tryAcquire()) {
+                LOG.trace("Work semaphore acquired, running task");
+                ctx.fireEvent(BulkheadEvents.DecisionMade.ACCEPTED);
+                ctx.fireEvent(BulkheadEvents.StartedRunning.INSTANCE);
+                try {
+                    return delegate.apply(ctx);
+                } finally {
+                    workSemaphore.release();
+                    LOG.trace("Work semaphore released, task finished");
+                    capacitySemaphore.release();
+                    LOG.trace("Capacity semaphore released, task leaving bulkhead");
+                    ctx.fireEvent(BulkheadEvents.FinishedRunning.INSTANCE);
+                }
+            } else {
+                capacitySemaphore.release();
+
+                LOG.debugOrTrace(description + " invocation prevented by bulkhead",
+                        "Work semaphore not acquired, rejecting task from bulkhead");
+                ctx.fireEvent(BulkheadEvents.DecisionMade.REJECTED);
+                return Future.ofError(new BulkheadException(description + " rejected from bulkhead"));
+            }
+        } else {
+            LOG.debugOrTrace(description + " invocation prevented by bulkhead",
+                    "Capacity semaphore not acquired, rejecting task from bulkhead");
+            ctx.fireEvent(BulkheadEvents.DecisionMade.REJECTED);
+            return Future.ofError(new BulkheadException(description + " rejected from bulkhead"));
+        }
+    }
+
+    private Future<V> applySyncWithQueueing(FaultToleranceContext<V> ctx) {
+        if (capacitySemaphore.tryAcquire()) {
+            LOG.trace("Capacity semaphore acquired, accepting task into bulkhead");
+            ctx.fireEvent(BulkheadEvents.DecisionMade.ACCEPTED);
+            ctx.fireEvent(BulkheadEvents.StartedWaiting.INSTANCE);
+
+            Object cancellationLock = new Object();
+            AtomicReference<Thread> threadToCancel = new AtomicReference<>(Thread.currentThread());
+            ctx.registerEventHandler(FutureCancellationEvent.class, event -> {
+                synchronized (cancellationLock) {
+                    Thread thread = threadToCancel.getAndSet(null);
+                    if (thread == null) {
+                        // in case of retries, multiple handlers of `FutureCancellationEvent` may be registered,
+                        // need to make sure that a handler belonging to an older bulkhead task doesn't do anything
+                        return;
+                    }
+
+                    if (LOG.isTraceEnabled()) {
+                        LOG.tracef("Cancelling bulkhead task,%s interrupting executing thread",
+                                (event.interruptible ? "" : " NOT"));
+                    }
+                    if (event.interruptible) {
+                        thread.interrupt();
+                    }
+                }
+            });
+
+            try {
+                workSemaphore.acquire();
+                LOG.trace("Work semaphore acquired, running task");
+            } catch (InterruptedException e) {
+                threadToCancel.set(null);
+
+                capacitySemaphore.release();
+                LOG.trace("Capacity semaphore released, task leaving bulkhead");
+                ctx.fireEvent(BulkheadEvents.FinishedWaiting.INSTANCE);
+                return Future.ofError(new CancellationException());
+            }
+
+            ctx.fireEvent(BulkheadEvents.FinishedWaiting.INSTANCE);
+            ctx.fireEvent(BulkheadEvents.StartedRunning.INSTANCE);
+            try {
+                if (threadToCancel.get() == null) {
+                    return Future.ofError(new CancellationException());
+                }
+                return delegate.apply(ctx);
+            } finally {
+                synchronized (cancellationLock) {
+                    threadToCancel.set(null);
+                }
+
+                workSemaphore.release();
+                LOG.trace("Work semaphore released, task finished");
+                capacitySemaphore.release();
+                LOG.trace("Capacity semaphore released, task leaving bulkhead");
+                ctx.fireEvent(BulkheadEvents.FinishedRunning.INSTANCE);
+            }
+        } else {
+            LOG.debugOrTrace(description + " invocation prevented by bulkhead",
+                    "Capacity semaphore not acquired, rejecting task from bulkhead");
+            ctx.fireEvent(BulkheadEvents.DecisionMade.REJECTED);
+            return Future.ofError(new BulkheadException(description + " rejected from bulkhead"));
+        }
+    }
+
+    private Future<V> applyAsync(FaultToleranceContext<V> ctx) {
+        if (capacitySemaphore.tryAcquire()) {
+            LOG.trace("Capacity semaphore acquired, accepting task into bulkhead");
+            ctx.fireEvent(BulkheadEvents.DecisionMade.ACCEPTED);
+            ctx.fireEvent(BulkheadEvents.StartedWaiting.INSTANCE);
+
+            BulkheadTask task = new BulkheadTask(ctx);
+            queue.addLast(task);
+            runQueuedTask();
+            return task.result.future();
+        } else {
+            LOG.debugOrTrace(description + " invocation prevented by bulkhead",
+                    "Capacity semaphore not acquired, rejecting task from bulkhead");
+            ctx.fireEvent(BulkheadEvents.DecisionMade.REJECTED);
+            return Future.ofError(new BulkheadException(description + " rejected from bulkhead"));
+        }
+    }
+
+    private void runQueuedTask() {
+        // `BulkheadTask.run()` returns `true` when the task completed synchronously,
+        // in which case we loop to process the next queued task. For async completion,
+        // the task's callback calls `runQueuedTask()` itself. This avoids unbounded
+        // recursion that would occur if the tasks's callback always called `runQueuedTask()`.
+        //
+        // The work semaphore is acquired _before_ polling the queue to prevent a race
+        // where a task is temporarily invisible (polled out of the queue but not yet
+        // put back) while a work permit becomes available, leaving the task stuck.
+        boolean loop;
+        do {
+            loop = false;
+            if (workSemaphore.tryAcquire()) {
+                BulkheadTask queuedTask = queue.pollFirst();
+                if (queuedTask != null) {
+                    LOG.trace("Work semaphore acquired, running task");
+                    loop = queuedTask.run();
+                } else {
+                    workSemaphore.release();
+                }
+            }
+        } while (loop);
+    }
+
+    // only for tests
+    int getQueueSize() {
+        return queue.size();
+    }
+
+    // only for tests
+    int getAvailableCapacityPermits() {
+        return capacitySemaphore.availablePermits();
+    }
+
+    private class BulkheadTask {
+        private static final int RUNNING = 0;
+        private static final int COMPLETED_SYNC = 1;
+        private static final int WILL_COMPLETE_ASYNC = 2;
+
+        private final Completer<V> result = Completer.create();
+        private final FaultToleranceContext<V> ctx;
+        private final AtomicInteger state = new AtomicInteger(RUNNING);
+
+        // queued task runs on a thread that completed a previous task, so the thread contexts
+        // of this task must be captured here, when the task is created, and restored in `run()`
+        private final Runnable contextualRun = runnableWrapper.wrap(this::doRun);
+
+        private BulkheadTask(FaultToleranceContext<V> ctx) {
+            this.ctx = ctx;
+        }
+
+        /**
+         * @return {@code true} if the task completed synchronously and the caller
+         *         should loop to process the next queued task (instead of recursing)
+         */
+        public boolean run() {
+            // calls `doRun()` with restored contexts
+            contextualRun.run();
+            // once `doRun()` returns, `state` cannot change
+            return state.get() == COMPLETED_SYNC;
+        }
+
+        private void doRun() {
+            ctx.fireEvent(BulkheadEvents.FinishedWaiting.INSTANCE);
+            ctx.fireEvent(BulkheadEvents.StartedRunning.INSTANCE);
+
+            Future<V> rawResult;
+            try {
+                rawResult = delegate.apply(ctx);
+                rawResult.then((value, error) -> {
+                    releaseSemaphores();
+                    ctx.fireEvent(BulkheadEvents.FinishedRunning.INSTANCE);
+
+                    if (error == null) {
+                        result.complete(value);
+                    } else {
+                        result.completeWithError(error);
+                    }
+
+                    if (!state.compareAndSet(RUNNING, COMPLETED_SYNC)) {
+                        runQueuedTask();
+                    }
+                });
+                state.compareAndSet(RUNNING, WILL_COMPLETE_ASYNC);
+            } catch (Exception e) {
+                releaseSemaphores();
+                ctx.fireEvent(BulkheadEvents.FinishedRunning.INSTANCE);
+
+                result.completeWithError(e);
+
+                state.set(COMPLETED_SYNC);
+            }
+        }
+
+        private void releaseSemaphores() {
+            workSemaphore.release();
+            LOG.trace("Work semaphore released, task finished");
+
+            capacitySemaphore.release();
+            LOG.trace("Capacity semaphore released, task leaving bulkhead");
+        }
+    }
+}

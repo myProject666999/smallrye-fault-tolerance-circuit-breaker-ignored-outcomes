@@ -1,0 +1,40 @@
+package io.smallrye.faulttolerance.core.metrics;
+
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+
+import io.smallrye.faulttolerance.core.FaultToleranceContext;
+import io.smallrye.faulttolerance.core.FaultToleranceStrategy;
+import io.smallrye.faulttolerance.core.Future;
+
+public class DelegatingMetricsCollector<V> implements FaultToleranceStrategy<V> {
+    private final FaultToleranceStrategy<V> delegate;
+    private final MetricsProvider provider;
+    private final MeteredOperation originalOperation;
+
+    // keyed by `MeteredOperation.cacheKey()`
+    private final ConcurrentMap<Object, MetricsCollector<V>> cache = new ConcurrentHashMap<>();
+
+    public DelegatingMetricsCollector(FaultToleranceStrategy<V> delegate,
+            MetricsProvider provider, MeteredOperation originalOperation) {
+        this.delegate = delegate;
+        this.provider = provider;
+        this.originalOperation = originalOperation;
+    }
+
+    @Override
+    public Future<V> apply(FaultToleranceContext<V> ctx) {
+        MeteredOperationMetadata metadata = ctx.get(MeteredOperationMetadata.class);
+        MeteredOperation operation = metadata != null
+                ? new DelegatingMeteredOperation(originalOperation, metadata)
+                : originalOperation;
+        FaultToleranceStrategy<V> delegate;
+        if (operation.enabled()) {
+            delegate = cache.computeIfAbsent(operation.cacheKey(),
+                    ignored -> new MetricsCollector<>(this.delegate, provider.create(operation), operation));
+        } else {
+            delegate = this.delegate;
+        }
+        return delegate.apply(ctx);
+    }
+}

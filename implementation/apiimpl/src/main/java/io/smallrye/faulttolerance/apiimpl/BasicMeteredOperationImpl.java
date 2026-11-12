@@ -1,0 +1,169 @@
+package io.smallrye.faulttolerance.apiimpl;
+
+import io.smallrye.faulttolerance.core.metrics.MeteredOperation;
+
+final class BasicMeteredOperationImpl implements MeteredOperation {
+    private final boolean enabled;
+    private final String name;
+    private final boolean mayBeAsynchronous;
+    private final boolean hasBulkhead;
+    private final int bulkheadLimit;
+    private final int bulkheadQueueSize;
+    private final boolean hasCircuitBreaker;
+    private final long circuitBreakerDelay;
+    private final int circuitBreakerRequestVolumeThreshold;
+    private final double circuitBreakerFailureRatio;
+    private final int circuitBreakerSuccessThreshold;
+    private final boolean hasFallback;
+    private final boolean hasRateLimit;
+    private final int rateLimitLimit;
+    private final long rateLimitWindow;
+    private final long rateLimitMinSpacing;
+    private final boolean hasRetry;
+    private final int retryMaxRetries;
+    private final long retryMaxDuration;
+    private final boolean hasTimeout;
+    private final long timeoutDuration;
+
+    BasicMeteredOperationImpl(boolean enabled, String name,
+            boolean mayBeAsynchronous,
+            boolean hasBulkhead, int bulkheadLimit, int bulkheadQueueSize,
+            boolean hasCircuitBreaker, long circuitBreakerDelay, int circuitBreakerRequestVolumeThreshold,
+            double circuitBreakerFailureRatio, int circuitBreakerSuccessThreshold,
+            boolean hasFallback,
+            boolean hasRateLimit, int rateLimitLimit, long rateLimitWindow, long rateLimitMinSpacing,
+            boolean hasRetry, int retryMaxRetries, long retryMaxDuration,
+            boolean hasTimeout, long timeoutDuration) {
+        this.enabled = enabled;
+        this.name = name;
+        this.mayBeAsynchronous = mayBeAsynchronous;
+        this.hasBulkhead = hasBulkhead;
+        this.bulkheadLimit = bulkheadLimit;
+        this.bulkheadQueueSize = bulkheadQueueSize;
+        this.hasCircuitBreaker = hasCircuitBreaker;
+        this.circuitBreakerDelay = circuitBreakerDelay;
+        this.circuitBreakerRequestVolumeThreshold = circuitBreakerRequestVolumeThreshold;
+        this.circuitBreakerFailureRatio = circuitBreakerFailureRatio;
+        this.circuitBreakerSuccessThreshold = circuitBreakerSuccessThreshold;
+        this.hasFallback = hasFallback;
+        this.hasRateLimit = hasRateLimit;
+        this.rateLimitLimit = rateLimitLimit;
+        this.rateLimitWindow = rateLimitWindow;
+        this.rateLimitMinSpacing = rateLimitMinSpacing;
+        this.hasRetry = hasRetry;
+        this.retryMaxRetries = retryMaxRetries;
+        this.retryMaxDuration = retryMaxDuration;
+        this.hasTimeout = hasTimeout;
+        this.timeoutDuration = timeoutDuration;
+    }
+
+    @Override
+    public boolean enabled() {
+        return enabled;
+    }
+
+    @Override
+    public boolean mayBeAsynchronous() {
+        return mayBeAsynchronous;
+    }
+
+    @Override
+    public boolean hasBulkhead() {
+        return hasBulkhead;
+    }
+
+    @Override
+    public int bulkheadLimit() {
+        return bulkheadLimit;
+    }
+
+    @Override
+    public int bulkheadQueueSize() {
+        return bulkheadQueueSize;
+    }
+
+    @Override
+    public boolean hasCircuitBreaker() {
+        return hasCircuitBreaker;
+    }
+
+    @Override
+    public long circuitBreakerDelay() {
+        return circuitBreakerDelay;
+    }
+
+    @Override
+    public int circuitBreakerRequestVolumeThreshold() {
+        return circuitBreakerRequestVolumeThreshold;
+    }
+
+    @Override
+    public double circuitBreakerFailureRatio() {
+        return circuitBreakerFailureRatio;
+    }
+
+    @Override
+    public int circuitBreakerSuccessThreshold() {
+        return circuitBreakerSuccessThreshold;
+    }
+
+    @Override
+    public boolean hasFallback() {
+        return hasFallback;
+    }
+
+    @Override
+    public boolean hasRateLimit() {
+        return hasRateLimit;
+    }
+
+    @Override
+    public int rateLimitLimit() {
+        return rateLimitLimit;
+    }
+
+    @Override
+    public long rateLimitWindow() {
+        return rateLimitWindow;
+    }
+
+    @Override
+    public long rateLimitMinSpacing() {
+        return rateLimitMinSpacing;
+    }
+
+    @Override
+    public boolean hasRetry() {
+        return hasRetry;
+    }
+
+    @Override
+    public int retryMaxRetries() {
+        return retryMaxRetries;
+    }
+
+    @Override
+    public long retryMaxDuration() {
+        return retryMaxDuration;
+    }
+
+    @Override
+    public boolean hasTimeout() {
+        return hasTimeout;
+    }
+
+    @Override
+    public long timeoutDuration() {
+        return timeoutDuration;
+    }
+
+    @Override
+    public String name() {
+        return name;
+    }
+
+    @Override
+    public Object cacheKey() {
+        return name;
+    }
+}

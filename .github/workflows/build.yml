@@ -1,0 +1,84 @@
+name: SmallRye Build
+
+on:
+  push:
+    branches:
+    - main
+    paths-ignore:
+    - '.gitattributes'
+    - '.gitignore'
+    - 'CODEOWNERS'
+    - 'LICENSE'
+    - 'NOTICE'
+    - 'README*'
+  pull_request:
+    paths-ignore:
+    - '.gitattributes'
+    - '.gitignore'
+    - 'CODEOWNERS'
+    - 'LICENSE'
+    - 'NOTICE'
+    - 'README*'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        java:
+        # we want: all LTS versions (that we care about), latest GA, upcoming
+        - 17
+        - 21
+        - 25
+        - 27
+        - 28-ea
+        os:
+        - ubuntu-latest
+        - windows-latest
+        - macos-latest
+    runs-on: ${{ matrix.os }}
+    name: Build with JDK ${{ matrix.java }} (${{ matrix.os }})
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+
+    - name: Set up JDK ${{ matrix.java }}
+      uses: actions/setup-java@v6
+      with:
+        distribution: temurin
+        java-version: ${{ matrix.java }}
+        cache: maven
+
+    - name: Build with Maven (Linux, Windows)
+      if: ${{ matrix.os == 'ubuntu-latest' || matrix.os == 'windows-latest' }}
+      shell: bash
+      run: mvn -s .github/maven-ci-settings.xml -B --no-transfer-progress formatter:validate verify --file pom.xml
+
+    - name: Build with Maven (Mac)
+      if: ${{ matrix.os == 'macos-latest' }}
+      shell: bash
+      run: mvn -s .github/maven-ci-settings.xml -B --no-transfer-progress formatter:validate verify --file pom.xml -Dorg.eclipse.microprofile.fault.tolerance.tck.timeout.multiplier=3.0 -DslowMachine
+
+  quality:
+    needs:
+    - build
+    if: github.event_name == 'push' && github.repository == 'smallrye/smallrye-fault-tolerance'
+    runs-on: ubuntu-latest
+    name: Quality
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v6
+      with:
+        distribution: temurin
+        java-version: 17
+        cache: maven
+
+    - name: Sonar
+      env:
+        GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+        SONAR_TOKEN: ${{secrets.SONAR_TOKEN}}
+      run: mvn -s .github/maven-ci-settings.xml -B --no-transfer-progress verify --file pom.xml -Pcoverage javadoc:javadoc sonar:sonar -Dsonar.projectKey=smallrye_smallrye-fault-tolerance -Dsonar.login=$SONAR_TOKEN

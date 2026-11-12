@@ -1,0 +1,329 @@
+package io.smallrye.faulttolerance.core.metrics;
+
+import static io.smallrye.faulttolerance.core.FaultToleranceContextUtil.sync;
+import static io.smallrye.faulttolerance.core.Invocation.invocation;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+import java.util.function.BooleanSupplier;
+import java.util.function.LongSupplier;
+
+import org.junit.jupiter.api.Test;
+
+import io.smallrye.faulttolerance.core.FaultToleranceContext;
+import io.smallrye.faulttolerance.core.FaultToleranceStrategy;
+import io.smallrye.faulttolerance.core.circuit.breaker.CircuitBreakerEvents;
+import io.smallrye.faulttolerance.core.util.TestException;
+
+// TODO should have a test for all metrics
+public class GeneralMetricsTest {
+    @Test
+    public void successfulInvocation() throws Throwable {
+        MockMetricsRecorder metrics = new MockMetricsRecorder();
+
+        MetricsCollector<String> collector = new MetricsCollector<>(invocation(), metrics, new MockMeteredOperation());
+        assertThat(collector.apply(sync(() -> "foobar")).awaitBlocking())
+                .isEqualTo("foobar");
+
+        assertThat(metrics.valueReturned).isEqualTo(1);
+        assertThat(metrics.exceptionThrown).isEqualTo(0);
+    }
+
+    @Test
+    public void failingInvocation() {
+        MockMetricsRecorder metrics = new MockMetricsRecorder();
+
+        MetricsCollector<Void> collector = new MetricsCollector<>(invocation(), metrics, new MockMeteredOperation());
+        assertThatThrownBy(collector.apply(sync(TestException::doThrow))::awaitBlocking)
+                .isExactlyInstanceOf(TestException.class);
+
+        assertThat(metrics.valueReturned).isEqualTo(0);
+        assertThat(metrics.exceptionThrown).isEqualTo(1);
+    }
+
+    // regression test for a memory leak in `DelegatingMetricsCollector`
+    @Test
+    public void metricsCollectorIsReusedForSameOperation() throws Throwable {
+        MockMetricsProvider provider = new MockMetricsProvider();
+        FaultToleranceStrategy<String> collector = new DelegatingMetricsCollector<>(invocation(), provider,
+                new MockMeteredOperation());
+
+        for (int i = 0; i < 1000; i++) {
+            FaultToleranceContext<String> ctx = sync(() -> "foobar");
+            ctx.set(MeteredOperationMetadata.class, new MeteredOperationMetadata("mock", false));
+            assertThat(collector.apply(ctx).awaitBlocking()).isEqualTo("foobar");
+        }
+
+        assertThat(provider.counter).isEqualTo(1);
+    }
+
+    @Test
+    public void hasFallbackIsTakenFromContext_true() throws Throwable {
+        MockMetricsProvider provider = new MockMetricsProvider();
+        FaultToleranceStrategy<String> collector = new DelegatingMetricsCollector<>(invocation(), provider,
+                new MockMeteredOperation(false));
+
+        FaultToleranceContext<String> ctx = sync(() -> "foobar");
+        ctx.set(MeteredOperationMetadata.class, new MeteredOperationMetadata("mock", true));
+        assertThat(collector.apply(ctx).awaitBlocking()).isEqualTo("foobar");
+
+        assertThat(provider.lastOperation.hasFallback()).isTrue();
+    }
+
+    @Test
+    public void hasFallbackIsTakenFromContext_false() throws Throwable {
+        MockMetricsProvider provider = new MockMetricsProvider();
+        FaultToleranceStrategy<String> collector = new DelegatingMetricsCollector<>(invocation(), provider,
+                new MockMeteredOperation(true));
+
+        FaultToleranceContext<String> ctx = sync(() -> "foobar");
+        ctx.set(MeteredOperationMetadata.class, new MeteredOperationMetadata("mock", false));
+        assertThat(collector.apply(ctx).awaitBlocking()).isEqualTo("foobar");
+
+        assertThat(provider.lastOperation.hasFallback()).isFalse();
+    }
+
+    @Test
+    public void hasFallbackDefaultsToOperation() throws Throwable {
+        MockMetricsProvider provider = new MockMetricsProvider();
+        FaultToleranceStrategy<String> collector = new DelegatingMetricsCollector<>(invocation(), provider,
+                new MockMeteredOperation(true));
+
+        assertThat(collector.apply(sync(() -> "foobar")).awaitBlocking()).isEqualTo("foobar");
+
+        assertThat(provider.lastOperation.hasFallback()).isTrue();
+    }
+
+    private static class MockMeteredOperation implements MeteredOperation {
+        private final boolean hasFallback;
+
+        MockMeteredOperation() {
+            this(false);
+        }
+
+        MockMeteredOperation(boolean hasFallback) {
+            this.hasFallback = hasFallback;
+        }
+
+        @Override
+        public boolean enabled() {
+            return true;
+        }
+
+        @Override
+        public boolean mayBeAsynchronous() {
+            return false;
+        }
+
+        @Override
+        public boolean hasBulkhead() {
+            return false;
+        }
+
+        @Override
+        public int bulkheadLimit() {
+            return 0;
+        }
+
+        @Override
+        public int bulkheadQueueSize() {
+            return 0;
+        }
+
+        @Override
+        public boolean hasCircuitBreaker() {
+            return false;
+        }
+
+        @Override
+        public long circuitBreakerDelay() {
+            return 0;
+        }
+
+        @Override
+        public int circuitBreakerRequestVolumeThreshold() {
+            return 0;
+        }
+
+        @Override
+        public double circuitBreakerFailureRatio() {
+            return 0;
+        }
+
+        @Override
+        public int circuitBreakerSuccessThreshold() {
+            return 0;
+        }
+
+        @Override
+        public boolean hasFallback() {
+            return hasFallback;
+        }
+
+        @Override
+        public boolean hasRateLimit() {
+            return false;
+        }
+
+        @Override
+        public int rateLimitLimit() {
+            return 0;
+        }
+
+        @Override
+        public long rateLimitWindow() {
+            return 0;
+        }
+
+        @Override
+        public long rateLimitMinSpacing() {
+            return 0;
+        }
+
+        @Override
+        public boolean hasRetry() {
+            return false;
+        }
+
+        @Override
+        public int retryMaxRetries() {
+            return 0;
+        }
+
+        @Override
+        public long retryMaxDuration() {
+            return 0;
+        }
+
+        @Override
+        public boolean hasTimeout() {
+            return false;
+        }
+
+        @Override
+        public long timeoutDuration() {
+            return 0;
+        }
+
+        @Override
+        public String name() {
+            return "mock";
+        }
+
+        @Override
+        public Object cacheKey() {
+            return name();
+        }
+    }
+
+    private static class MockMetricsProvider implements MetricsProvider {
+        int counter;
+        MeteredOperation lastOperation;
+
+        @Override
+        public boolean isEnabled() {
+            return true;
+        }
+
+        @Override
+        public MetricsRecorder create(MeteredOperation operation) {
+            counter++;
+            lastOperation = operation;
+            return new MockMetricsRecorder();
+        }
+    }
+
+    private static class MockMetricsRecorder implements MetricsRecorder {
+        int valueReturned;
+        int exceptionThrown;
+
+        @Override
+        public void executionFinished(boolean succeeded, boolean fallbackDefined, boolean fallbackApplied, long duration) {
+            if (succeeded) {
+                valueReturned++;
+            } else {
+                exceptionThrown++;
+            }
+        }
+
+        @Override
+        public void retryAttempted() {
+        }
+
+        @Override
+        public void retryValueReturned(boolean retried) {
+        }
+
+        @Override
+        public void retryExceptionNotRetryable(boolean retried) {
+        }
+
+        @Override
+        public void retryMaxRetriesReached(boolean retried) {
+        }
+
+        @Override
+        public void retryMaxDurationReached(boolean retried) {
+        }
+
+        @Override
+        public void timeoutFinished(boolean timedOut, long time) {
+        }
+
+        @Override
+        public void circuitBreakerFinished(CircuitBreakerEvents.Result result) {
+        }
+
+        @Override
+        public void circuitBreakerMovedToOpen() {
+        }
+
+        @Override
+        public void registerCircuitBreakerIsClosed(BooleanSupplier supplier) {
+        }
+
+        @Override
+        public void registerCircuitBreakerIsOpen(BooleanSupplier supplier) {
+        }
+
+        @Override
+        public void registerCircuitBreakerIsHalfOpen(BooleanSupplier supplier) {
+        }
+
+        @Override
+        public void registerCircuitBreakerTimeSpentInClosed(LongSupplier supplier) {
+        }
+
+        @Override
+        public void registerCircuitBreakerTimeSpentInOpen(LongSupplier supplier) {
+        }
+
+        @Override
+        public void registerCircuitBreakerTimeSpentInHalfOpen(LongSupplier supplier) {
+        }
+
+        @Override
+        public void bulkheadDecisionMade(boolean accepted) {
+        }
+
+        @Override
+        public void registerBulkheadExecutionsRunning(LongSupplier supplier) {
+        }
+
+        @Override
+        public void registerBulkheadExecutionsWaiting(LongSupplier supplier) {
+        }
+
+        @Override
+        public void updateBulkheadRunningDuration(long time) {
+        }
+
+        @Override
+        public void updateBulkheadWaitingDuration(long time) {
+        }
+
+        @Override
+        public void rateLimitDecisionMade(boolean permitted) {
+        }
+    }
+}

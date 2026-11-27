@@ -37,3 +37,4 @@
 ** xref:internals/core.adoc[Fault Tolerance Core]
 ** xref:internals/config.adoc[Configuration System]
 ** xref:internals/logging.adoc[Logging]
+** xref:internals/circuit-breaker-ignored-outcomes.adoc[Circuit Breaker Ignored Outcomes]

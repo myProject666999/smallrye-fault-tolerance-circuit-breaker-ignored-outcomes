@@ -397,11 +397,66 @@ public interface Guard {
              * that do not match this predicate are implicitly considered success.
              * <p>
              * If this method is called, {@code failOn} and {@code skipOn} may not be called.
+             * This method may be combined with {@link #ignoreOn(Collection) ignoreOn} and
+             * {@link #ignoreWhen(Predicate) ignoreWhen}, because ignoring an exception is an independent
+             * dimension from considering it a success or a failure.
              *
              * @param value the predicate, must not be {@code null}
              * @return this circuit breaker builder
              */
             CircuitBreakerBuilder when(Predicate<Throwable> value);
+
+            /**
+             * Sets the set of exception types that the circuit breaker ignores. An ignored invocation
+             * is neither a success nor a failure: it is not recorded in the circuit breaker's rolling
+             * window, it does not count towards the consecutive successful probe invocations in
+             * half-open state, and it does not trigger any state transition. The guarded method still
+             * runs and the original exception is still propagated to the caller unchanged.
+             * <p>
+             * This is useful when the guarded method is itself wrapped by another strategy that may
+             * reject an invocation (such as a rate limit or a bulkhead): such rejections typically
+             * don't indicate a failure of the guarded method and so should not open the circuit breaker.
+             * <p>
+             * The ignored exceptions are evaluated first, using a two-phase process: the type of
+             * the thrown exception is inspected before its cause chain, and within each phase
+             * an ignored exception takes precedence over both {@code skipOn} and {@code failOn}.
+             * <p>
+             * The ignore decision is an independent dimension, so this method may be combined with
+             * {@link #failOn(Collection) failOn}, {@link #skipOn(Collection) skipOn} and
+             * {@link #when(Predicate) when}. If {@link #ignoreWhen(Predicate) ignoreWhen} is called,
+             * this method may not be called.
+             *
+             * @param value collection of exception types, must not be {@code null}
+             * @return this circuit breaker builder
+             */
+            CircuitBreakerBuilder ignoreOn(Collection<Class<? extends Throwable>> value);
+
+            /**
+             * Equivalent to {@link #ignoreOn(Collection) ignoreOn(Set.of(value))}.
+             *
+             * @param value an exception class, must not be {@code null}
+             * @return this circuit breaker builder
+             */
+            CircuitBreakerBuilder ignoreOn(Class<? extends Throwable> value);
+
+            /**
+             * Sets a predicate to determine when an exception should be ignored by the circuit breaker,
+             * meaning the invocation is neither recorded as a success nor as a failure. The original
+             * exception is still propagated to the caller unchanged.
+             * <p>
+             * Ignoring an exception is an independent dimension from considering it a success
+             * or a failure, so this method may be combined with {@link #failOn(Collection) failOn},
+             * {@link #skipOn(Collection) skipOn} and {@link #when(Predicate) when}. If
+             * {@link #ignoreOn(Collection) ignoreOn} is called, this method may not be called.
+             * <p>
+             * If this predicate throws an exception, the exception is treated as not ignored
+             * and the usual success/failure decision is used instead.
+             *
+             * @param value the predicate, must not be {@code null}; returning {@code true} means
+             *        the exception is ignored
+             * @return this circuit breaker builder
+             */
+            CircuitBreakerBuilder ignoreWhen(Predicate<Throwable> value);
 
             /**
              * Sets the delay after which an open circuit moves to half-open. Defaults to 5 seconds.

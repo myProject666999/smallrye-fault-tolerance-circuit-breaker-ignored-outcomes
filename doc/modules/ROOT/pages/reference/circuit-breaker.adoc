@@ -135,7 +135,7 @@ Circuit breaker exposes the following metrics:
 a| * OpenTelemetry: `LongCounter`
 * Micrometer: `Counter`
 | Unit | None
-| Description | The number of times the circuit breaker logic was run. This is usually once per method call, but may be more than once if the method call is retried.
+| Description | The number of times the circuit breaker logic was run. This is usually once per method call, but may be more than once if the method call is retried. Invocations with an xref:ignored-exceptions[ignored] outcome are not counted, so the sum of this metric may be smaller than the actual number of invocations.
 | Tags
 a| * `method` - the fully qualified method name
 * `circuitBreakerResult` = `[success\|failure\|circuitBreakerOpen]` - the result of the method call, as considered by the circuit breaker
@@ -347,3 +347,83 @@ public Result doSomething() {
 <1> If `doSomething` throws an `ExpectedOutcomeException`, or a `WrapperException` whose cause is `ExpectedOutcomeException`, the circuit breaker treats it as a success.
 <2> There's no `failOn`, so the 2nd step in the algorithm above is skipped.
 This is what turns the `WrapperException` whose cause is `ExpectedOutcomeException` into a success.
+
+[[ignored-exceptions]]
+=== Ignoring Exceptions
+
+include::partial$srye-feature.adoc[]
+
+Besides success and failure, the programmatic API (`Guard` and `TypedGuard`) supports a third circuit breaker outcome: _ignored_.
+This is useful when a strategy nested inside the circuit breaker (a rate limit or a bulkhead) rejects an invocation before the guarded method ever runs.
+Counting such a rejection as a failure would open the circuit breaker even though the guarded method itself never failed; counting it as a success would likewise distort the failure ratio in the rolling window.
+An ignored invocation is invisible to the circuit breaker:
+
+[cols="1,1,1,1,1"]
+|===
+| Outcome | Rolling window (closed) | Consecutive successes (half-open) | State transition | Propagated to caller
+
+| success
+| one success recorded
+| incremented
+| may move half-open to closed
+| value returned, as usual
+
+| failure
+| one failure recorded
+| not incremented
+| may move closed to open, or half-open back to open
+| original exception, as usual
+
+| ignored
+| nothing recorded
+| not incremented
+| none
+| the original exception, unchanged (no wrapping)
+|===
+
+The ignored exceptions are configured using `ignoreOn(...)` (a set of exception types) or `ignoreWhen(...)` (a predicate) on the circuit breaker builder:
+
+[source,java]
+----
+Guard guard = Guard.create()
+        .withCircuitBreaker()
+        .requestVolumeThreshold(4)
+        .ignoreOn(RateLimitException.class) // <1>
+        .done()
+        .withRateLimit().limit(1).window(1, ChronoUnit.MINUTES).done()
+        .build();
+----
+
+<1> Rate limit rejections propagate out of the rate limit strategy into the circuit breaker, but they are not recorded there.
+
+==== Priority against failOn and skipOn
+
+The success/failure decision (`failOn` / `skipOn`, or `when()`) and the ignore decision are two independent dimensions, so they may be combined freely; in particular, `ignoreOn` / `ignoreWhen` may be used together with `when()`.
+Only the two ignore variants themselves are mutually exclusive.
+
+For the set-based form, the classification follows the same two-phase process as the success/failure decision:
+
+. The _thrown exception's own type_ is inspected first. An explicit `skipOn` or `failOn` match takes precedence; the default `failOn` set (all throwables) is skipped at this stage. Only if the exception itself matches neither `skipOn` nor `failOn` may it be ignored.
+. If phase 1 didn't match, the _cause chain_ is inspected (the programmatic API always does this). Each cause is checked in the order ignored, `skipOn`, `failOn`, so within one cause, ignoring takes precedence.
+
+The explicit success/failure match on the exception itself winning over ignore is required when an ignored type is a subtype of a `failOn` type.
+For example, with `failOn(IllegalStateException)` and `ignoreOn(RateLimitException)`:
+
+* `new IllegalStateException("x", new RateLimitException(...))` is a _failure_: the thrown exception itself matches `failOn`, so the ignored cause cannot override it.
+* `new RuntimeException("y", new RateLimitException(...))` is _ignored_: the thrown exception itself matches nothing, and the cause chain contains the ignored exception.
+
+If the ignore predicate (`ignoreWhen`) itself throws, the exception is treated as not ignored and the usual success/failure decision is used instead; a warning is logged.
+
+==== Half-open probe slots
+
+A half-open circuit breaker allows at most `successThreshold` probe invocations to be in flight at any time.
+An ignored probe neither counts as a consecutive success nor reopens the circuit breaker, so it must _return its probe slot_: otherwise, once all slots were consumed by ignored probes, no further probe could ever run and the circuit breaker would be stuck half-open until a manual `reset`.
+The slot is returned on the same half-open state object that granted it, so an ignored probe completing after the circuit breaker has already moved to another state (for example, because another probe failed and reopened it) never affects the slots of a later half-open phase.
+
+==== Events and metrics of ignored invocations
+
+Ignored invocations do not fire a `CircuitBreakerEvents.Finished` event and therefore do not trigger the `onSuccess`, `onFailure` or `onPrevented` callbacks.
+They also do not increment `ft.circuitbreaker.calls.total`: only `success`, `failure` and `circuitBreakerOpen` results are counted, which means the sum of that metric may be smaller than the actual number of invocations.
+This trade-off was chosen over adding a new metric result value, because a new value would require synchronized changes in the Micrometer recorder, the OpenTelemetry recorder, the event handlers and this documentation; both recorders throw an `IllegalArgumentException` on an unknown result in their default branch, and the metrics collector's handlers are not wrapped the way user callbacks are, so a single missed update would turn into a hard failure on the synchronous invocation path.
+An ignored outcome is logged at trace level with the exception class name and the circuit breaker description only; the exception message is not logged, because it may contain invocation arguments (for example, a rate limit exception may carry request parameters).
+

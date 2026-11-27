@@ -208,6 +208,25 @@ If, on the other hand, you use different `Guard` objects for guarding different 
 
 If you call the `adapt*` methods on the same `Guard` multiple times, the resulting `Callable` or `Supplier` objects will guard the underlying action using the original `Guard` instance, so stateful strategies will be shared.
 
+=== Circuit Breaker Ignored Exceptions
+
+Besides success and failure, a circuit breaker configured through the programmatic API can _ignore_ selected exceptions.
+An ignored invocation is neither recorded in the rolling window nor counted as a half-open probe success, and it triggers no state transition; the original exception is still propagated unchanged.
+This is useful for rejections from a nested rate limit or bulkhead, which don't signal a failure of the guarded method:
+
+[source,java]
+----
+Guard guard = Guard.create()
+        .withCircuitBreaker().requestVolumeThreshold(4).ignoreOn(RateLimitException.class).done()
+        .withRateLimit().limit(1).window(1, ChronoUnit.MINUTES).done()
+        .build();
+----
+
+Use `ignoreOn(...)` for a set of exception types or `ignoreWhen(...)` for a predicate; the two are mutually exclusive.
+The ignore decision is independent of the success/failure decision (`failOn` / `skipOn` or `when`), so it may be combined with any of them.
+Ignored invocations do not fire the circuit breaker finished event and are not counted in `ft.circuitbreaker.calls.total`.
+See xref:reference/circuit-breaker.adoc#ignored-exceptions[Ignoring Exceptions] for the full priority rules and behavior.
+
 === Circuit Breaker Maintenance
 
 The `CircuitBreakerMaintenance` API, accessed through `CircuitBreakerMaintenance.get()` or by injection in the CDI implementation, can be used to manipulate all named circuit breakers.

@@ -6,11 +6,13 @@ import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.Set;
 
-public class SetBasedExceptionDecision implements ExceptionDecision {
+public class SetBasedExceptionDecision implements ExceptionDecision, ExceptionIgnore {
     // @CircuitBreaker.failOn, @Fallback.applyOn, @Retry.retryOn
     private final SetOfThrowables consideredFailure;
     // @CircuitBreaker.skipOn, @Fallback.skipOn, @Retry.abortOn
     private final SetOfThrowables consideredExpected;
+    // circuit breaker "ignore" outcome only; empty for retry and fallback
+    private final SetOfThrowables consideredIgnored;
 
     private final boolean inspectCauseChain;
 
@@ -19,67 +21,85 @@ public class SetBasedExceptionDecision implements ExceptionDecision {
 
     public SetBasedExceptionDecision(SetOfThrowables consideredFailure, SetOfThrowables consideredExpected,
             boolean inspectCauseChain) {
+        this(consideredFailure, consideredExpected, SetOfThrowables.EMPTY, inspectCauseChain);
+    }
+
+    public SetBasedExceptionDecision(SetOfThrowables consideredFailure, SetOfThrowables consideredExpected,
+            SetOfThrowables consideredIgnored, boolean inspectCauseChain) {
         this.consideredFailure = checkNotNull(consideredFailure, "Set of considered-failure throwables must be set");
         this.consideredExpected = checkNotNull(consideredExpected, "Set of considered-expected throwables must be set");
+        this.consideredIgnored = checkNotNull(consideredIgnored, "Set of considered-ignored throwables must be set");
         this.inspectCauseChain = inspectCauseChain;
         this.nonDefaultConsideredFailure = !consideredFailure.isAll();
         this.nonDefaultConsideredExpected = !consideredExpected.isEmpty();
     }
 
     public boolean isConsideredExpected(Throwable e) {
-        // per `@CircuitBreaker` javadoc, `skipOn` takes priority over `failOn`
-        // per `@Fallback` javadoc, `skipOn` takes priority over `applyOn`
-        // per `@Retry` javadoc, `abortOn` takes priority over `retryOn`
-        // to sum up, the exceptions considered expected win over those considered failure
-        if (inspectCauseChain) {
-            return isConsideredExpectedWithCauseChain(e);
-        } else {
-            return isConsideredExpectedDefault(e);
-        }
+        return classify(e) != Outcome.FAILURE;
     }
 
-    private boolean isConsideredExpectedDefault(Throwable e) {
-        if (consideredExpected.includes(e.getClass())) {
-            return true;
-        }
-        if (consideredFailure.includes(e.getClass())) {
-            return false;
-        }
-        return true;
+    @Override
+    public boolean isIgnored(Throwable e) {
+        return classify(e) == Outcome.IGNORED;
     }
 
-    private boolean isConsideredExpectedWithCauseChain(Throwable e) {
+    private enum Outcome {
+        SUCCESS,
+        FAILURE,
+        IGNORED,
+    }
+
+    // Two-phase classification:
+    //
+    // 1. only the exception's own type is inspected. First, an explicit success (skipOn) or failure
+    //    (failOn) takes precedence -- the default failOn set (all throwables) is skipped, so that
+    //    unknown exceptions may still be found on the cause chain. Only if the exception itself matches
+    //    neither skipOn nor failOn, it may be ignored. This way, a failOn type that is a supertype
+    //    of an ignored type (e.g. failOn(RuntimeException) together with ignore(RateLimitException),
+    //    where RateLimitException is a RuntimeException) still classifies the thrown exception itself
+    //    as a failure and is not shadowed by the ignore set.
+    // 2. only if phase 1 didn't match, the cause chain is traversed (when enabled) and each cause
+    //    is inspected in order: ignored, skipOn, failOn. Ignored wins over expected and failure
+    //    within one cause, because the exception itself already matched none of the success/failure sets.
+    //
+    // The default failOn set matches every throwable, so it is only consulted as a last-resort fallback
+    // after the cause chain. This preserves the previous behavior where the default failOn set always
+    // indicated a failure, while not shadowing skipOn / ignore matches on the cause chain.
+    private Outcome classify(Throwable e) {
+        // phase 1: exception's own type; explicit skipOn / failOn take precedence over ignore
         if (nonDefaultConsideredExpected && consideredExpected.includes(e.getClass())) {
-            return true;
+            return Outcome.SUCCESS;
         }
         if (nonDefaultConsideredFailure && consideredFailure.includes(e.getClass())) {
-            return false;
+            return Outcome.FAILURE;
+        }
+        if (consideredIgnored.includes(e.getClass())) {
+            return Outcome.IGNORED;
         }
 
-        if (includes(consideredExpected, e)) {
-            return true;
-        }
-        if (includes(consideredFailure, e)) {
-            return false;
-        }
+        // phase 2: cause chain; ignored takes precedence within each cause
+        if (inspectCauseChain) {
+            Set<Throwable> alreadySeen = Collections.newSetFromMap(new IdentityHashMap<>());
+            Throwable cause = e.getCause();
+            while (cause != null && !alreadySeen.contains(cause)) {
+                alreadySeen.add(cause);
 
-        return true;
-    }
+                if (consideredIgnored.includes(cause.getClass())) {
+                    return Outcome.IGNORED;
+                }
+                if (consideredExpected.includes(cause.getClass())) {
+                    return Outcome.SUCCESS;
+                }
+                if (consideredFailure.includes(cause.getClass())) {
+                    return Outcome.FAILURE;
+                }
 
-    private boolean includes(SetOfThrowables set, Throwable e) {
-        Set<Throwable> alreadySeen = Collections.newSetFromMap(new IdentityHashMap<>());
-
-        // guard against hypothetical cycle in the cause chain
-        while (e != null && !alreadySeen.contains(e)) {
-            alreadySeen.add(e);
-
-            if (set.includes(e.getClass())) {
-                return true;
+                cause = cause.getCause();
             }
-
-            e = e.getCause();
         }
 
-        return false;
+        // last resort: the default failOn set (all throwables) means failure,
+        // otherwise an unknown exception is considered expected
+        return consideredFailure.isAll() ? Outcome.FAILURE : Outcome.SUCCESS;
     }
 }

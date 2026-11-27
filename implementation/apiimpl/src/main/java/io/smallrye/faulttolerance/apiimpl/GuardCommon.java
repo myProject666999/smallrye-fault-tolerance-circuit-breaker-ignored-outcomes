@@ -16,7 +16,9 @@ import io.smallrye.faulttolerance.core.invocation.AsyncSupportRegistry;
 import io.smallrye.faulttolerance.core.invocation.Invoker;
 import io.smallrye.faulttolerance.core.invocation.StrategyInvoker;
 import io.smallrye.faulttolerance.core.util.ExceptionDecision;
+import io.smallrye.faulttolerance.core.util.ExceptionIgnore;
 import io.smallrye.faulttolerance.core.util.PredicateBasedExceptionDecision;
+import io.smallrye.faulttolerance.core.util.PredicateBasedExceptionIgnore;
 import io.smallrye.faulttolerance.core.util.PredicateBasedResultDecision;
 import io.smallrye.faulttolerance.core.util.ResultDecision;
 import io.smallrye.faulttolerance.core.util.SetBasedExceptionDecision;
@@ -107,6 +109,41 @@ final class GuardCommon {
         }
         return new SetBasedExceptionDecision(createSetOfThrowables(consideredFailure),
                 createSetOfThrowables(consideredExpected), true);
+    }
+
+    // Circuit breaker only: creates the success/failure decision and the independent ignore decision.
+    //
+    // The programmatic API always inspects exception cause chains. When both dimensions are set-based,
+    // a single `SetBasedExceptionDecision` object implements both interfaces, so that the two-phase
+    // classification (exception's own type first, then the cause chain) treats the ignored set
+    // as part of the same priority order. The ignore decision is an independent dimension and may
+    // freely be combined with `when()` or `failOn()` / `skipOn()`.
+    static CircuitBreakerDecisions createCircuitBreakerDecisions(Class<? extends Throwable>[] consideredExpected,
+            Class<? extends Throwable>[] consideredFailure, Predicate<Throwable> whenExceptionPredicate,
+            Class<? extends Throwable>[] consideredIgnored, Predicate<Throwable> ignoreExceptionPredicate) {
+        if (whenExceptionPredicate != null) {
+            // the builder API accepts a predicate that returns `true` when an exception is considered failure,
+            // but `PredicateBasedExceptionDecision` accepts a predicate that returns `true` when an exception
+            // is considered success -- hence the negation
+            ExceptionDecision decision = new PredicateBasedExceptionDecision(whenExceptionPredicate.negate());
+            ExceptionIgnore ignore = ignoreExceptionPredicate != null
+                    ? new PredicateBasedExceptionIgnore(ignoreExceptionPredicate)
+                    : new SetBasedExceptionDecision(SetOfThrowables.EMPTY, SetOfThrowables.EMPTY,
+                            createSetOfThrowables(consideredIgnored), true);
+            return new CircuitBreakerDecisions(decision, ignore);
+        }
+
+        SetBasedExceptionDecision setBasedDecision = new SetBasedExceptionDecision(
+                createSetOfThrowables(consideredFailure),
+                createSetOfThrowables(consideredExpected),
+                createSetOfThrowables(consideredIgnored), true);
+        ExceptionIgnore ignore = ignoreExceptionPredicate != null
+                ? new PredicateBasedExceptionIgnore(ignoreExceptionPredicate)
+                : setBasedDecision;
+        return new CircuitBreakerDecisions(setBasedDecision, ignore);
+    }
+
+    record CircuitBreakerDecisions(ExceptionDecision exceptionDecision, ExceptionIgnore exceptionIgnore) {
     }
 
     private static SetOfThrowables createSetOfThrowables(Class<? extends Throwable>[] throwableClasses) {

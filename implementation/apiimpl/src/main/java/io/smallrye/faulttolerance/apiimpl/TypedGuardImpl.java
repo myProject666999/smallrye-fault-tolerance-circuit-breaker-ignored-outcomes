@@ -270,9 +270,12 @@ public final class TypedGuardImpl<V, T> implements TypedGuard<T> {
             }
 
             if (lazyDependencies.ftEnabled() && op.hasCircuitBreaker()) {
+                GuardCommon.CircuitBreakerDecisions decisions = GuardCommon.createCircuitBreakerDecisions(
+                        op.getCircuitBreaker().skipOn(), op.getCircuitBreaker().failOn(),
+                        circuitBreakerBuilder.whenPredicate,
+                        circuitBreakerBuilder.ignoreOn, circuitBreakerBuilder.ignoreWhenPredicate);
                 result = new CircuitBreaker<>(result, description,
-                        createExceptionDecision(op.getCircuitBreaker().skipOn(), op.getCircuitBreaker().failOn(),
-                                circuitBreakerBuilder.whenPredicate),
+                        decisions.exceptionDecision(), decisions.exceptionIgnore(),
                         timeInMillis(op.getCircuitBreaker().delay(), op.getCircuitBreaker().delayUnit()),
                         op.getCircuitBreaker().requestVolumeThreshold(),
                         op.getCircuitBreaker().failureRatio(),
@@ -492,6 +495,8 @@ public final class TypedGuardImpl<V, T> implements TypedGuard<T> {
             private Class<? extends Throwable>[] skipOn = new Class[] {};
             private boolean setBasedExceptionDecisionDefined = false;
             private Predicate<Throwable> whenPredicate;
+            private Class<? extends Throwable>[] ignoreOn = new Class[] {};
+            private Predicate<Throwable> ignoreWhenPredicate;
             private long delay = 5000;
             private ChronoUnit delayUnit = ChronoUnit.MILLIS;
             private int requestVolumeThreshold = 20;
@@ -540,6 +545,24 @@ public final class TypedGuardImpl<V, T> implements TypedGuard<T> {
             @Override
             public CircuitBreakerBuilder<T> when(Predicate<Throwable> value) {
                 this.whenPredicate = checkNotNull(value, "Exception predicate must be set");
+                return this;
+            }
+
+            @Override
+            public CircuitBreakerBuilder<T> ignoreOn(Collection<Class<? extends Throwable>> value) {
+                this.ignoreOn = checkNotNull(value, "Exceptions to ignore must be set").toArray(new Class[0]);
+                return this;
+            }
+
+            @Override
+            public CircuitBreakerBuilder<T> ignoreOn(Class<? extends Throwable> value) {
+                this.ignoreOn = new Class[] { checkNotNull(value, "Exception to ignore must be set") };
+                return this;
+            }
+
+            @Override
+            public CircuitBreakerBuilder<T> ignoreWhen(Predicate<Throwable> value) {
+                this.ignoreWhenPredicate = checkNotNull(value, "Exception ignore predicate must be set");
                 return this;
             }
 
@@ -605,6 +628,9 @@ public final class TypedGuardImpl<V, T> implements TypedGuard<T> {
             public Builder<T> done() {
                 if (whenPredicate != null && setBasedExceptionDecisionDefined) {
                     throw new IllegalStateException("The when() method may not be combined with failOn() / skipOn()");
+                }
+                if (ignoreWhenPredicate != null && ignoreOn.length > 0) {
+                    throw new IllegalStateException("The ignoreWhen() method may not be combined with ignoreOn()");
                 }
 
                 parent.circuitBreakerBuilder = this;

@@ -1,0 +1,107 @@
+# Circuit Breaker Ignored Outcomes — Design Rationale
+
+## Background
+
+A `Guard` may combine `RateLimit` / `Bulkhead` with a `CircuitBreaker`. Following the assembly
+order in `GuardImpl.buildStrategy` / `FaultToleranceInterceptor.prepareStrategy`, the circuit
+breaker wraps the rate limit, timeout and bulkhead. A rejection thrown by an inner strategy
+(`RateLimitException`, `BulkheadException`) therefore reaches the circuit breaker unchanged.
+
+The circuit breaker previously only knew two outcomes, derived from
+`ExceptionDecision.isConsideredExpected`:
+
+- expected → success;
+- unexpected → failure.
+
+Because `failOn` defaults to `Throwable`, a rejection was counted as a failure and could open the
+breaker even though the guarded backend was never called. Adding the rejection type to `skipOn`
+would instead count it as a success. Both choices distort the success/failure ratio in the rolling
+window. This change adds a third outcome, **ignored**.
+
+## The three outcomes
+
+| Outcome | Rolling window (CLOSED) | `consecutiveSuccesses` (HALF_OPEN) | State transition | Caller sees |
+|---|---|---|---|---|
+| success | one success bit recorded | incremented | HALF_OPEN → CLOSED when threshold reached | normal value |
+| failure | one failure bit recorded | not incremented | CLOSED → OPEN, or HALF_OPEN → OPEN | the original exception |
+| ignored | nothing recorded | not incremented | none | the original exception, never wrapped |
+
+`ExceptionDecision` still serves retry and fallback with unchanged boolean semantics
+(`isConsideredExpected`). The ignore check is a separate, circuit-breaker-only abstraction
+(`ExceptionIgnore`), passed as an optional constructor argument. The original nine-argument
+constructor and all four of its call sites (two in `GuardImpl`/`TypedGuardImpl`, two assembly
+paths in `FaultToleranceInterceptor`) are unchanged; they default to `ExceptionIgnore.NEVER`.
+
+## Two-stage priority rule
+
+`SetBasedExceptionDecision` already inspected the exception's own type before walking the cause
+chain, skipping the default `failOn` set. The set-based ignore decision reuses that exact
+two-phase structure so all three sets share one classification:
+
+1. **Exception's own type.** An explicit (non-default) `skipOn` or `failOn` match wins first;
+   the default `failOn` (all throwables) is skipped here. Only if the exception itself matches
+   neither may it be ignored.
+2. **Cause chain** (only when phase 1 did not match, and only if enabled). Each cause is checked
+   in order ignored → `skipOn` → `failOn`; ignore wins within one cause.
+
+The precedence on the exception itself matters because an ignored type can be a subtype of a
+`failOn` type. `RateLimitException` is a `RuntimeException`; with
+`failOn(IllegalStateException)` + `ignoreOn(RateLimitException)`:
+
+- `new IllegalStateException("x", new RateLimitException(...))` → **failure** (the thrown
+  exception itself matches `failOn`; the ignored cause cannot override it).
+- `new RuntimeException("y", new RateLimitException(...))` → **ignored** (the thrown exception
+  matches nothing; the ignored exception is found on the cause chain).
+
+The programmatic path always enables cause-chain inspection
+(`GuardCommon.createCircuitBreakerDecisions`); the annotation path keeps using
+`specCompatibility.inspectExceptionCauseChain()` and never configures an ignore set.
+
+If the ignore predicate itself throws, the exception is treated as not ignored and the ordinary
+success/failure decision applies; a warning is logged.
+
+## Why ignored half-open probes return their slot
+
+`inHalfOpen` increments `probeAttempts` before allowing a probe and never returns the slot on
+completion. If ignored probes kept their slots, consuming all `successThreshold` slots with
+ignored invocations would leave the half-open breaker unable to ever close or reopen — every later
+request would be prevented and only a manual `reset` could recover.
+
+An ignored probe therefore decrements the same `probeAttempts` counter, so the number of in-flight
+probes never exceeds `successThreshold` while a freed slot can be reused. `apply` dereferences
+`state` exactly once and passes that `State` object to every state method; the decrement targets
+the `State` captured when the probe was admitted, so a probe that completes after the breaker has
+already transitioned (e.g. another probe failed and reopened it) decrements the old, discarded
+state object and can never corrupt the slots of a later half-open phase.
+
+A request rejected because `probeAttempts` already reached the threshold also returns its
+provisional increment, keeping the counter equal to the number of actually in-flight probes.
+
+## Event / metrics scheme
+
+Two options were considered for how an ignored invocation appears externally.
+
+- **Scheme 甲 (chosen): do not fire `CircuitBreakerEvents.Finished`.** Ignored invocations do not
+  increment `ft.circuitbreaker.calls.total`, introduce no new metric label value, and do not run
+  the `onSuccess` / `onFailure` / `onPrevented` callbacks. The trade-off is that the sum of
+  `calls.total` may be smaller than the actual number of invocations.
+- **Scheme 乙 (rejected): add a new `CircuitBreakerEvents.Result` value.** This would require
+  coordinated changes in `MicrometerRecorder`, `OpenTelemetryRecorder`, `EventHandlers` and the
+  `circuitBreakerResult` documentation. Both recorders throw `IllegalArgumentException` from their
+  `default` branch on an unknown result, and the handler registered by `MetricsCollector` — unlike
+  user callbacks — is not protected by `Callbacks.wrap`. Missing a single update site would turn
+  into a hard failure on the synchronous path, where an already-complete future runs its callback
+  on the calling thread and an exception from the callback would be caught by the outer
+  `catch (Throwable)` in `inClosed`/`inHalfOpen`, recording the same invocation twice.
+
+Under either scheme ignored invocations trigger neither `onSuccess` nor `onFailure`. The ignored
+outcome is logged at trace level containing only the exception class name and the breaker
+description; the exception message is never logged because it may carry invocation parameters
+(for example a rate-limit message may embed request arguments).
+
+## Scope
+
+Programmatic API first: both `Guard.Builder.CircuitBreakerBuilder` and
+`TypedGuard.Builder.CircuitBreakerBuilder` gain the same `ignoreOn(...)` / `ignoreWhen(...)`
+methods with identical semantics (enforced by `GuardBuilderConsistencyTest`). No annotation member
+is added in this change.

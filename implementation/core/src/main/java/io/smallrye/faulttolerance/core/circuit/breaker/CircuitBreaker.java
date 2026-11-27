@@ -17,6 +17,7 @@ import io.smallrye.faulttolerance.core.stopwatch.RunningStopwatch;
 import io.smallrye.faulttolerance.core.stopwatch.Stopwatch;
 import io.smallrye.faulttolerance.core.timer.Timer;
 import io.smallrye.faulttolerance.core.util.ExceptionDecision;
+import io.smallrye.faulttolerance.core.util.ExceptionIgnore;
 
 public class CircuitBreaker<V> implements FaultToleranceStrategy<V> {
     public static final int STATE_CLOSED = 0;
@@ -27,6 +28,7 @@ public class CircuitBreaker<V> implements FaultToleranceStrategy<V> {
     private final String description;
 
     private final ExceptionDecision exceptionDecision;
+    private final ExceptionIgnore exceptionIgnore;
     private final long delayInMillis;
     private final int rollingWindowSize;
     private final int failureThreshold;
@@ -39,9 +41,18 @@ public class CircuitBreaker<V> implements FaultToleranceStrategy<V> {
     public CircuitBreaker(FaultToleranceStrategy<V> delegate, String description, ExceptionDecision exceptionDecision,
             long delayInMillis, int requestVolumeThreshold, double failureRatio, int successThreshold,
             Stopwatch stopwatch, Timer timer) {
+        this(delegate, description, exceptionDecision, ExceptionIgnore.NEVER,
+                delayInMillis, requestVolumeThreshold, failureRatio, successThreshold, stopwatch, timer);
+    }
+
+    public CircuitBreaker(FaultToleranceStrategy<V> delegate, String description, ExceptionDecision exceptionDecision,
+            ExceptionIgnore exceptionIgnore,
+            long delayInMillis, int requestVolumeThreshold, double failureRatio, int successThreshold,
+            Stopwatch stopwatch, Timer timer) {
         this.delegate = checkNotNull(delegate, "Circuit breaker delegate must be set");
         this.description = checkNotNull(description, "Circuit breaker description must be set");
         this.exceptionDecision = checkNotNull(exceptionDecision, "Exception decision must be set");
+        this.exceptionIgnore = checkNotNull(exceptionIgnore, "Exception ignore decision must be set");
         this.delayInMillis = check(delayInMillis, delayInMillis >= 0, "Circuit breaker delay must be >= 0");
         this.successThreshold = check(successThreshold, successThreshold > 0, "Circuit breaker success threshold must be > 0");
         this.stopwatch = checkNotNull(stopwatch, "Stopwatch must be set");
@@ -82,29 +93,42 @@ public class CircuitBreaker<V> implements FaultToleranceStrategy<V> {
 
             delegate.apply(ctx).then((value, error) -> {
                 if (error == null) {
-                    inClosedHandleResult(true, ctx, state);
+                    inClosedHandleResult(Outcome.SUCCESS, ctx, state);
                     result.complete(value);
                 } else {
-                    inClosedHandleResult(exceptionDecision.isConsideredExpected(error), ctx, state);
+                    inClosedHandleResult(classify(error), ctx, state);
                     result.completeWithError(error);
                 }
             });
 
             return result.future();
         } catch (Throwable e) {
-            inClosedHandleResult(exceptionDecision.isConsideredExpected(e), ctx, state);
+            inClosedHandleResult(classify(e), ctx, state);
             return Future.ofError(e);
         }
     }
 
-    private void inClosedHandleResult(boolean isSuccess, FaultToleranceContext<V> ctx, State state) {
-        ctx.fireEvent(isSuccess ? CircuitBreakerEvents.Finished.SUCCESS : CircuitBreakerEvents.Finished.FAILURE);
-        boolean failureThresholdReached = isSuccess
-                ? state.rollingWindow.recordSuccess()
-                : state.rollingWindow.recordFailure();
-        if (failureThresholdReached) {
-            LOG.trace("Failure threshold reached, circuit breaker moving to open");
-            toOpen(ctx, state);
+    private void inClosedHandleResult(Outcome outcome, FaultToleranceContext<V> ctx, State state) {
+        switch (outcome) {
+            case SUCCESS -> {
+                ctx.fireEvent(CircuitBreakerEvents.Finished.SUCCESS);
+                boolean failureThresholdReached = state.rollingWindow.recordSuccess();
+                if (failureThresholdReached) {
+                    LOG.trace("Failure threshold reached, circuit breaker moving to open");
+                    toOpen(ctx, state);
+                }
+            }
+            case FAILURE -> {
+                ctx.fireEvent(CircuitBreakerEvents.Finished.FAILURE);
+                boolean failureThresholdReached = state.rollingWindow.recordFailure();
+                if (failureThresholdReached) {
+                    LOG.trace("Failure threshold reached, circuit breaker moving to open");
+                    toOpen(ctx, state);
+                }
+            }
+            case IGNORED -> {
+                // no event, no rolling window record: the invocation is invisible to the circuit breaker
+            }
         }
     }
 
@@ -133,6 +157,7 @@ public class CircuitBreaker<V> implements FaultToleranceStrategy<V> {
 
     private Future<V> inHalfOpen(FaultToleranceContext<V> ctx, State state) {
         if (state.probeAttempts.incrementAndGet() > successThreshold) {
+            state.probeAttempts.decrementAndGet();
             LOG.debugOrTrace(description + " invocation prevented by circuit breaker",
                     "Circuit breaker half-open, invocation prevented");
             ctx.fireEvent(CircuitBreakerEvents.Finished.PREVENTED);
@@ -145,34 +170,80 @@ public class CircuitBreaker<V> implements FaultToleranceStrategy<V> {
             Completer<V> result = Completer.create();
 
             delegate.apply(ctx).then((value, error) -> {
+                Outcome outcome = error == null ? Outcome.SUCCESS : classify(error);
+                if (outcome == Outcome.IGNORED) {
+                    // the ignored probe occupies no slot: it does not count towards consecutive successes
+                    // and it does not reopen the circuit breaker, so its slot is returned for another probe
+                    state.probeAttempts.decrementAndGet();
+                }
+                inHalfOpenHandleResult(outcome, ctx, state);
                 if (error == null) {
-                    inHalfOpenHandleResult(true, ctx, state);
                     result.complete(value);
                 } else {
-                    inHalfOpenHandleResult(exceptionDecision.isConsideredExpected(error), ctx, state);
                     result.completeWithError(error);
                 }
             });
 
             return result.future();
         } catch (Throwable e) {
-            inHalfOpenHandleResult(exceptionDecision.isConsideredExpected(e), ctx, state);
+            Outcome outcome = classify(e);
+            if (outcome == Outcome.IGNORED) {
+                state.probeAttempts.decrementAndGet();
+            }
+            inHalfOpenHandleResult(outcome, ctx, state);
             return Future.ofError(e);
         }
     }
 
-    private void inHalfOpenHandleResult(boolean isSuccess, FaultToleranceContext<V> ctx, State state) {
-        ctx.fireEvent(isSuccess ? CircuitBreakerEvents.Finished.SUCCESS : CircuitBreakerEvents.Finished.FAILURE);
-        if (isSuccess) {
-            int successes = state.consecutiveSuccesses.incrementAndGet();
-            if (successes >= successThreshold) {
-                LOG.trace("Success threshold reached, circuit breaker moving to closed");
-                toClosed(ctx, state);
+    private void inHalfOpenHandleResult(Outcome outcome, FaultToleranceContext<V> ctx, State state) {
+        switch (outcome) {
+            case SUCCESS -> {
+                ctx.fireEvent(CircuitBreakerEvents.Finished.SUCCESS);
+                int successes = state.consecutiveSuccesses.incrementAndGet();
+                if (successes >= successThreshold) {
+                    LOG.trace("Success threshold reached, circuit breaker moving to closed");
+                    toClosed(ctx, state);
+                }
             }
-        } else {
-            LOG.trace("Failure while in half-open, circuit breaker moving to open");
-            toOpen(ctx, state);
+            case FAILURE -> {
+                ctx.fireEvent(CircuitBreakerEvents.Finished.FAILURE);
+                LOG.trace("Failure while in half-open, circuit breaker moving to open");
+                toOpen(ctx, state);
+            }
+            case IGNORED -> {
+                // no event, no consecutive success and no state transition: the probe is invisible
+            }
         }
+    }
+
+    // Classifies an exception into one of three circuit breaker outcomes.
+    //
+    // The ignore decision is a separate dimension from the success/failure decision. If the ignore
+    // decision itself throws, the exception is treated as not ignored and the usual success/failure
+    // decision is used instead; a warning is logged.
+    private Outcome classify(Throwable e) {
+        boolean ignored;
+        try {
+            ignored = exceptionIgnore.isIgnored(e);
+        } catch (Throwable decisionError) {
+            LOG.warnf(decisionError,
+                    "Exception ignore decision threw for %s on circuit breaker %s, ignoring the decision",
+                    e.getClass().getName(), description);
+            ignored = false;
+        }
+
+        if (ignored) {
+            LOG.tracef("Exception %s ignored by circuit breaker %s", e.getClass().getName(), description);
+            return Outcome.IGNORED;
+        }
+
+        return exceptionDecision.isConsideredExpected(e) ? Outcome.SUCCESS : Outcome.FAILURE;
+    }
+
+    private enum Outcome {
+        SUCCESS,
+        FAILURE,
+        IGNORED,
     }
 
     void toClosed(FaultToleranceContext<V> ctx, State state) {
